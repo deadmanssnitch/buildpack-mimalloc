@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir> <env-dir>
+set -e
+
+# Parse params
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+# SHA256 checksums of the sources hosted on GitHub at https://github.com/microsoft/mimalloc/tags
+declare -A checksums=(
+  ['1.9.4']='2fc9795fc2a6b85a1c25b2a4a4e4a42109c8433a262362ac1e60521f55cbf381'
+  ['2.2.4']='754a98de5e2912fddbeaf24830f982b4540992f1bab4a0a8796ee118e0752bda'
+  ['3.1.5']='1c6949032069d5ebea438ec5cedd602d06f40a92ddf0f0d9dcff0993e5f6635c'
+)
+
+# Default version
+version="2.2.4"
+
+# Read version from configured MIMALLOC_VERSION
+if [ -f $ENV_DIR/MIMALLOC_VERSION ]; then
+  version=$(cat $ENV_DIR/MIMALLOC_VERSION)
+fi
+
+# dest is the path in the application that mimalloc will be extracted to.
+dest="$BUILD_DIR/vendor/mimalloc"
+
+# bundle is the full path to the cached mimalloc binaries for this version.
+bundle="$CACHE_DIR/mimalloc/${STACK}_$version.tar.gz"
+
+function download() {
+  url="https://github.com/microsoft/mimalloc/archive/refs/tags/v$version.tar.gz"
+
+  # Disable exit on command failure so we can provide better error messages
+  set +e
+
+  echo "       mimalloc: Downloading $url"
+  status=$(curl -sL -f  -w "%{http_code}" -o /tmp/mimalloc.tar.gz $url)
+
+  if [[ $status -ge 300 ]]; then
+    echo " !     mimalloc: Server returned HTTP $status"
+    exit 1
+  fi
+
+  # Fetch the checksum from checksums above or from MIMALLOC_CHECKSUM if set.
+  checksum="${checksums[$version]}"
+  if [ -f $ENV_DIR/MIMALLOC_CHECKSUM ]; then
+    checksum=$(cat $ENV_DIR/MIMALLOC_CHECKSUM)
+  fi
+
+  # Verify the SHA256 checksum for the source
+  if [[ ! -z "$checksum" ]]; then
+    echo "$checksum  /tmp/mimalloc.tar.gz" | sha256sum --status -c -
+
+    # Ensure the checksum passed
+    retVal=$?
+    if [[ $retVal -ne 0 ]]; then
+      echo " !     mimalloc: Downloaded source failed checksum"
+      echo "       mimalloc: Expected \"$checksum\""
+      echo "       mimalloc: Actual   \"$(sha256sum /tmp/mimalloc.tar.gz | awk '{ print $1 }')\""
+      exit $retVal
+    fi
+  else
+    echo " !     mimalloc: Missing checksum for $version was \"$(sha256sum /tmp/mimalloc.tar.gz | awk '{ print $1 }')\""
+  fi
+
+  # Reenable exit on failure
+  set -e
+}
+
+function compile() {
+  set +e
+
+  build="$(mktemp -d)"
+
+  echo "       mimalloc: Compiling $version"
+  (
+    # Only applies to this sub-shell
+    set -e
+
+    # Logs for the sub-shell go to /tmp/mimalloc.log for printing in case of an
+    # error.
+    exec > /tmp/mimalloc.log 2>&1
+
+    # Use a temporary directory to extract and compile the source
+    cd $(mktemp -d)
+
+
+    mkdir -p "$build/lib"
+    mkdir -p "$build/bin"
+
+    # Extract the source 
+    tar --strip-components=1 -xz -f /tmp/mimalloc.tar.gz
+
+    # Configure and compile mimalloc
+    cmake -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build
+
+    # Install only the shared library into the cache
+    cp build/libmimalloc.so "$build/lib/"
+
+    (cat <<- 'EOF') | sed 's/^\s*//g' > $build/bin/mimalloc.sh
+      #!/bin/sh
+      
+      export LD_PRELOAD="/app/vendor/mimalloc/lib/libmimalloc.so $LD_PRELOAD"
+      exec "$@"
+		EOF
+
+    # Make malloc.sh executable
+    chmod +x $build/bin/mimalloc.sh
+  )
+
+  retVal=$?
+  if [[ $retVal -ne 0 ]]; then
+    echo " !     mimalloc: Failed to compile mimalloc"
+    cat /tmp/mimalloc.log
+
+    exit $retVal
+  fi
+
+  # Reenable exit on failure
+  set -e
+
+  # Ensure the main cache directory exists for mimalloc build artifacts
+  mkdir -p $(dirname $bundle)
+
+  # Create the final gzipped bundle and store it in cache directory
+  tar -cz -f "$bundle" -C $build .
+}
+
+# Check if this version of mimalloc is in the cache and download it if it
+# doesn't exist.
+if [[ ! -f $bundle ]]; then
+  echo "-----> mimalloc: Installing $version from source"
+
+  download
+  compile
+else
+  echo "-----> mimalloc: Installing $version from cache"
+fi
+
+mkdir -p $dest
+tar -x -z -f $bundle -C $dest/
+
+mkdir -p $BUILD_DIR/.profile.d
+
+cat <<'EOF' > $BUILD_DIR/.profile.d/mimalloc.sh
+export PATH="$PATH:/app/vendor/mimalloc/bin"
+
+# Configure LD_PRELOAD when MIMALLOC_ENABLED is set to "true".
+if [ "$MIMALLOC_ENABLED" = 'true' ]; then
+  export LD_PRELOAD="/app/vendor/mimalloc/lib/libmimalloc.so $LD_PRELOAD"
+fi
+EOF
+
+echo "-----> mimalloc: Done"
