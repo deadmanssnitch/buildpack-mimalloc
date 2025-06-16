@@ -78,6 +78,18 @@ require a code change to be deployed in order to take affect.
 heroku config:set MIMALLOC_VERSION=2.2.4
 ```
 
+## Likely Questions
+
+### How do I know it's working?
+
+```bash
+heroku run -a [app name] -- bash -c 'MIMALLOC_SHOW_STATS=1 ruby -e exit'
+```
+
+When mimalloc is configured correctly that will print out a table of stats. As
+long as you see output you can be sure that mimalloc is at least loaded
+correctly.
+
 ## Development
 
 Run `make console` to start up a shell in a test build environment that mimic's
